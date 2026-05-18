@@ -35,7 +35,11 @@ const {
 } = input;
 
 if (!msEmail || !msPassword) {
-    throw new Error('Missing MS_EMAIL or MS_PASSWORD. Set them as Apify Secrets.');
+    log.warning(
+        'MS_EMAIL / MS_PASSWORD missing. Actor will only work if a valid storageState ' +
+        'is preloaded in KV Store "bing-session" (typically via Google OAuth from local ' +
+        'export). If session is invalid, this run will fail at login.',
+    );
 }
 
 log.info(`Run started: ${sites.length} sites, last ${daysBack} days, dryRun=${dryRun}`);
@@ -128,7 +132,17 @@ async function ensureLoggedIn() {
         return;
     }
 
-    log.warning('Session invalid or expired — performing fresh login');
+    log.warning('Session invalid or expired — fresh login needed');
+
+    if (!msEmail || !msPassword) {
+        throw new Error(
+            'Session is invalid and MS_EMAIL/MS_PASSWORD are not set. ' +
+            'EITHER provide MS credentials in Apify Secrets (works only for Microsoft-linked WMT accounts), ' +
+            'OR re-export a fresh storageState from a local Playwright login via Google OAuth ' +
+            'and upload it to KV Store "bing-session" → key "storageState". ' +
+            'See repo docs for export-bing-session.js script.',
+        );
+    }
 
     // Per GPT+Gemini konsenzus: jdi PŘÍMO na BWT-specific signin URL.
     // Ta zachová správný app context a auto-route pro @tdt.cz tenant na microsoftonline.com.
