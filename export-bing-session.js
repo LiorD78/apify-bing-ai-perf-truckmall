@@ -32,11 +32,11 @@
  *   SKIP_UPLOAD          (optional, "1")        — uloží jen lokálně, neuploadne
  */
 
-const { chromium } = require('playwright');
-const readline = require('readline');
-const fs = require('fs');
-const path = require('path');
-const https = require('https');
+import { chromium } from 'playwright';
+import readline from 'readline';
+import fs from 'fs';
+import path from 'path';
+import https from 'https';
 
 const OUTPUT_FILE = path.join(process.cwd(), 'bing-storage-state.json');
 const DEFAULT_KV_STORE_ID = 'pbSattQT3QKR63WIv';
