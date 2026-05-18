@@ -54,24 +54,6 @@ const context = await browser.newContext({
     locale: 'en-US',
 });
 
-// Patch fetch BEFORE any page loads, ať zachytíme CSRF z prvního UI volání
-await context.addInitScript(() => {
-    window.__capturedHeaders = null;
-    const origFetch = window.fetch;
-    window.fetch = function (input, init) {
-        const url = typeof input === 'string' ? input : input.url;
-        if (url.includes('aiperformance') && init && init.headers) {
-            const h = {};
-            if (init.headers instanceof Headers) init.headers.forEach((v, k) => (h[k] = v));
-            else Object.assign(h, init.headers);
-            if (h['X-CSRF-Token'] || h['x-csrf-token']) {
-                window.__capturedHeaders = h;
-            }
-        }
-        return origFetch.apply(this, arguments);
-    };
-});
-
 const page = await context.newPage();
 
 // ─── LOGIN ────────────────────────────────────────────────────────────────
@@ -131,16 +113,20 @@ function formatRFC1123(date) {
     return date.toUTCString();
 }
 
-async function getCSRFForSite(siteUrl) {
-    const url = `https://www.bing.com/webmasters/aiperformance?siteUrl=${encodeURIComponent(siteUrl)}`;
-    await page.goto(url, { waitUntil: 'networkidle' });
-    await page.waitForTimeout(3000); // give UI time to make the first XHR
-
-    const headers = await page.evaluate(() => window.__capturedHeaders);
-    if (!headers) {
-        throw new Error(`No CSRF token captured for ${siteUrl}. UI may not have loaded.`);
+async function getCSRF() {
+    // Bing WMT vrací CSRF token jako plain text z GET /webmasters/auth/token.
+    // Token je validní pro celou session (nepatří k jednomu site URL).
+    const result = await page.evaluate(async () => {
+        const r = await fetch('/webmasters/auth/token', { credentials: 'include' });
+        return { status: r.status, body: (await r.text()).trim() };
+    });
+    if (result.status !== 200 || !result.body) {
+        throw new Error(`Failed to fetch CSRF token: HTTP ${result.status}`);
     }
-    return headers['X-CSRF-Token'] || headers['x-csrf-token'];
+    if (!/^[a-f0-9]{32}$/i.test(result.body)) {
+        throw new Error(`Unexpected CSRF token format: "${result.body.substring(0, 50)}"`);
+    }
+    return result.body;
 }
 
 async function callApi(endpoint, csrf, body) {
@@ -173,6 +159,12 @@ const startDate = new Date(today.getTime() - daysBack * 24 * 60 * 60 * 1000);
 
 await ensureLoggedIn();
 
+// Get CSRF token once — valid for entire session (not per-site)
+log.info('Fetching CSRF token from /webmasters/auth/token …');
+await page.goto('https://www.bing.com/webmasters/home', { waitUntil: 'domcontentloaded' });
+const csrf = await getCSRF();
+log.info(`✓ CSRF token obtained (${csrf.substring(0, 8)}…)`);
+
 const allData = {
     runDate: today.toISOString(),
     daysBack,
@@ -185,7 +177,6 @@ const allData = {
 for (const siteUrl of sites) {
     log.info(`─── ${siteUrl} ───`);
     try {
-        const csrf = await getCSRFForSite(siteUrl);
         const baseBody = {
             SiteUrl: siteUrl,
             DateRange: {
