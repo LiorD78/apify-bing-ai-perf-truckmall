@@ -57,19 +57,54 @@ const context = await browser.newContext({
 const page = await context.newPage();
 
 // ─── LOGIN ────────────────────────────────────────────────────────────────
-async function ensureLoggedIn() {
-    log.info('Verifying Bing WMT session…');
+async function isSessionValid() {
+    // Check actual API auth by calling profile endpoint, which requires login
     await page.goto('https://www.bing.com/webmasters/home', { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(2000);
 
-    const url = page.url();
-    if (!url.includes('login') && !url.includes('signin') && !url.includes('account.live')) {
+    const profileCheck = await page.evaluate(async () => {
+        try {
+            const r = await fetch('/webmasters/api/globalelements/profile', {
+                credentials: 'include',
+                headers: { 'Accept': 'application/json' },
+            });
+            const text = await r.text();
+            return {
+                status: r.status,
+                hasUserData: text.includes('UserId') || text.includes('user') || text.includes('email'),
+                bodyPreview: text.substring(0, 200),
+            };
+        } catch (err) {
+            return { error: err.message };
+        }
+    });
+
+    log.info(`Profile check: status=${profileCheck.status}, hasUser=${profileCheck.hasUserData}`);
+    return profileCheck.status === 200 && profileCheck.hasUserData;
+}
+
+async function ensureLoggedIn() {
+    log.info('Verifying Bing WMT session…');
+
+    if (await isSessionValid()) {
         log.info('✓ Session valid, skipping login');
         return;
     }
 
-    log.warning('Session expired — performing fresh login');
+    log.warning('Session invalid or expired — performing fresh login');
+
+    // Force navigation to login page
+    await page.goto('https://www.bing.com/webmasters/home', { waitUntil: 'domcontentloaded' });
+
+    // Click "Sign in" button if present (homepage has it visible when not logged in)
+    const signInButton = page.locator('a:has-text("Sign in"), button:has-text("Sign in")').first();
+    if (await signInButton.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await signInButton.click();
+        await page.waitForLoadState('networkidle');
+    }
+
     // Microsoft email step
+    await page.waitForSelector('input[type="email"]', { timeout: 15000 });
     await page.fill('input[type="email"]', msEmail);
     await Promise.all([
         page.click('input[type="submit"]'),
@@ -82,15 +117,15 @@ async function ensureLoggedIn() {
     await page.click('input[type="submit"]');
 
     // MFA may be required here — see runtime logs
-    log.info('Submitted password. Waiting for MFA / next step (up to 90s)…');
+    log.info('Submitted password. Waiting for MFA approval (up to 120s)…');
 
     try {
-        await page.waitForURL(/webmasters/, { timeout: 90000 });
+        await page.waitForURL(/webmasters\/(home|dashboard|aiperformance)/, { timeout: 120000 });
     } catch (err) {
         const screenshotBuf = await page.screenshot({ fullPage: true });
         await Actor.setValue('mfa-blocker.png', screenshotBuf, { contentType: 'image/png' });
         throw new Error(
-            'Login did not reach Webmaster Tools within 90s. ' +
+            'Login did not reach Webmaster Tools within 120s. ' +
             'Probably MFA challenge waiting. Open mfa-blocker.png in KV Store to investigate. ' +
             'Solution: run actor interactively via Apify Console "Resurrect run" with Live View, complete MFA manually.',
         );
@@ -100,9 +135,17 @@ async function ensureLoggedIn() {
     const staySignedIn = page.locator('input[value="Yes"]');
     if (await staySignedIn.isVisible({ timeout: 5000 }).catch(() => false)) {
         await staySignedIn.click();
+        await page.waitForLoadState('networkidle');
     }
 
-    log.info('✓ Login successful');
+    // Verify the session is actually working
+    if (!(await isSessionValid())) {
+        const screenshotBuf = await page.screenshot({ fullPage: true });
+        await Actor.setValue('post-login-failed.png', screenshotBuf, { contentType: 'image/png' });
+        throw new Error('Login flow completed but profile API still returns invalid. Session not established.');
+    }
+
+    log.info('✓ Login successful, persisting session');
     const fresh = await context.storageState();
     await sessionStore.setValue('storageState', fresh);
 }
