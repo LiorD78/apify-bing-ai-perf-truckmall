@@ -1,0 +1,56 @@
+{
+    "title": "Bing AI Performance — TRUCKMALL",
+    "description": "Stahuje AI citation data z Bing Webmaster Tools pro TRUCKMALL group (truckmall.cz/.sk, tdt.cz/.sk, tagra.eu) a posílá výsledky do Make webhooku.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "msEmail": {
+            "title": "Microsoft account email",
+            "type": "string",
+            "description": "Email pro login do Bing Webmaster Tools. Použij Apify Secret (klikni 🔒).",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "msPassword": {
+            "title": "Microsoft account password",
+            "type": "string",
+            "description": "Heslo pro Bing Webmaster Tools. Použij Apify Secret (klikni 🔒).",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "makeWebhookUrl": {
+            "title": "Make webhook URL",
+            "type": "string",
+            "description": "URL Make scenario webhooku, kam se pošle výsledný JSON. Pokud prázdné, data jdou jen do Apify Datasetu.",
+            "editor": "textfield"
+        },
+        "sites": {
+            "title": "Sites to scrape",
+            "type": "array",
+            "description": "URL-prefix format jako v Bing WMT (https://www.example.com/).",
+            "default": [
+                "https://www.truckmall.cz/",
+                "https://www.truckmall.sk/",
+                "https://www.tdt.cz/",
+                "https://www.tdt.sk/",
+                "https://tagra.eu/"
+            ],
+            "editor": "stringList"
+        },
+        "daysBack": {
+            "title": "Days back",
+            "type": "integer",
+            "description": "Kolik dní zpět tahat data. 90 = 3 měsíce (Bing UI default).",
+            "default": 90,
+            "minimum": 1,
+            "maximum": 365
+        },
+        "dryRun": {
+            "title": "Dry run",
+            "type": "boolean",
+            "description": "Pokud true, neposílá Make webhook (jen Apify Dataset).",
+            "default": false
+        }
+    },
+    "required": ["msEmail", "msPassword"]
+}
