@@ -125,9 +125,13 @@ async function ensureLoggedIn() {
     await page.fill('input[name="loginfmt"], input[type="email"]', msEmail);
     await page.click('#idSIButton9, input[type="submit"], button[type="submit"]');
     await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(3000);
 
     log.info(`After email URL = ${page.url()}`);
+
+    // Screenshot ASAP after email so we can see what MS shows (FIDO? password? Authenticator?)
+    const debugBuf2 = await page.screenshot({ fullPage: true });
+    await Actor.setValue('debug-2-after-email.png', debugBuf2, { contentType: 'image/png' });
 
     // Account type split tile for AAD vs MSA (rare but possible)
     const aadTile = page.locator('#aadTile');
@@ -135,11 +139,58 @@ async function ensureLoggedIn() {
         log.info('AAD/MSA split tile detected — choosing Work/School account');
         await aadTile.click();
         await page.waitForLoadState('domcontentloaded');
+        await page.waitForTimeout(2000);
+    }
+
+    // FIDO/passkey bypass: Microsoft may force passkey by default for personal MSA.
+    // Look for "Use your password instead" or "Sign in another way" or similar links.
+    if (page.url().includes('/fido/') || page.url().includes('/passkey')) {
+        log.info('FIDO/passkey page detected, looking for password fallback link …');
+        const fallbackSelectors = [
+            'a:has-text("Use your password")',
+            'a:has-text("Sign in with password")',
+            'button:has-text("Use your password")',
+            'a:has-text("Sign-in options")',
+            'a:has-text("Sign in another way")',
+            'a:has-text("Other ways to sign in")',
+            'a[href*="password"]',
+            '#idA_PWD_SwitchToPassword',
+            '#signInAnotherWay',
+            '[data-testid*="signInOptions"]',
+        ];
+        let bypassed = false;
+        for (const sel of fallbackSelectors) {
+            const el = page.locator(sel).first();
+            if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
+                log.info(`  Clicking password fallback: ${sel}`);
+                await el.click().catch(() => {});
+                await page.waitForLoadState('domcontentloaded').catch(() => {});
+                await page.waitForTimeout(2000);
+                bypassed = true;
+                break;
+            }
+        }
+        if (bypassed) {
+            // Some flows show a list of options — pick "Password" tile
+            const passwordTile = page.locator(
+                'div[role="button"]:has-text("Password"), button:has-text("Password"), [data-value="password"]'
+            ).first();
+            if (await passwordTile.isVisible({ timeout: 3000 }).catch(() => false)) {
+                log.info('  Selecting "Password" from options list …');
+                await passwordTile.click().catch(() => {});
+                await page.waitForLoadState('domcontentloaded').catch(() => {});
+                await page.waitForTimeout(2000);
+            }
+            const debugBuf2b = await page.screenshot({ fullPage: true });
+            await Actor.setValue('debug-2b-after-fido-bypass.png', debugBuf2b, { contentType: 'image/png' });
+        } else {
+            log.warning('Could not find password fallback link on FIDO page — see debug-2-after-email.png');
+        }
     }
 
     // Password step
     log.info('Waiting for password input …');
-    await page.waitForSelector('input[name="passwd"], input[type="password"]', { timeout: 20000 });
+    await page.waitForSelector('input[name="passwd"], input[type="password"]', { timeout: 25000 });
     await page.fill('input[name="passwd"], input[type="password"]', msPassword);
     await page.click('#idSIButton9, input[type="submit"], button[type="submit"]');
 
