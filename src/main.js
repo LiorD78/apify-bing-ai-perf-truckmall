@@ -44,7 +44,15 @@ log.info(`Run started: ${sites.length} sites, last ${daysBack} days, dryRun=${dr
 const sessionStore = await Actor.openKeyValueStore('bing-session');
 const savedState = await sessionStore.getValue('storageState');
 
-const browser = await chromium.launch({ headless: true });
+// CRITICAL: --disable-features=WebAuthentication prevents Microsoft from routing
+// personal MSA logins to /consumers/fido/get (passkey screen). Without this,
+// MS detects browser supports WebAuthn and forces passkey instead of password.
+// Verified solution per GPT consensus (works in Apify headless Chromium).
+const browser = await chromium.launch({
+    headless: true,
+    args: ['--disable-features=WebAuthentication'],
+});
+
 const context = await browser.newContext({
     storageState: savedState || undefined,
     userAgent:
@@ -52,6 +60,35 @@ const context = await browser.newContext({
         'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
     viewport: { width: 1400, height: 900 },
     locale: 'en-US',
+});
+
+// Defense in depth: also hide PublicKeyCredential at the JS level in case
+// MS detects it via JS check before submitting the email.
+await context.addInitScript(() => {
+    try { Object.defineProperty(window, 'PublicKeyCredential', { get: () => undefined }); } catch {}
+    try {
+        const proto = Object.getPrototypeOf(navigator);
+        Object.defineProperty(proto, 'credentials', { get: () => undefined });
+    } catch {}
+});
+
+// Defense in depth #2: intercept the GetCredentialType.srf POST and force
+// isFidoSupported=false. MS decides FIDO vs password based on this response.
+await context.route('https://login.live.com/**', async (route) => {
+    const req = route.request();
+    if (req.method() === 'POST' && /\/GetCredentialType\.srf$/.test(req.url())) {
+        try {
+            const body = JSON.parse(req.postData() || '{}');
+            body.isFidoSupported = false;
+            body.isFidoEnabled = false;
+            await route.continue({
+                postData: JSON.stringify(body),
+                headers: { ...req.headers(), 'content-type': 'application/json' },
+            });
+            return;
+        } catch (_) { /* fall through */ }
+    }
+    await route.continue();
 });
 
 const page = await context.newPage();
