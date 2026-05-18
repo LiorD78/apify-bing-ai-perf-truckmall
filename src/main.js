@@ -2,15 +2,20 @@
 // Scope: truckmall.cz, truckmall.sk, tdt.cz, tdt.sk, tagra.eu
 //
 // Co dělá:
-//   1) Přihlásí se do Bing Webmaster Tools (storage state reuse → MFA jen 1×)
-//   2) Pro každý web extrahuje CSRF token z UI a zavolá 3 interní API endpointy:
+//   1) Načte session storageState z Apify KV Store 'bing-session' (key 'storageState')
+//   2) Validuje session GET /webmasters/api/globalelements/profile (HTTP 200 + user data)
+//   3) Pro každý web extrahuje CSRF token z UI a zavolá 3 interní API endpointy:
 //      - citationstats (totals + timeseries)
 //      - pages/stats (top citované URL)
 //      - searchqueries/stats (grounding queries; často prázdné = 404)
-//   3) Výsledky pošle na Make webhook (jeden router payload pro celý TRUCKMALL projekt)
-//   4) Uloží také do Apify Dataset pro historii
+//   4) Výsledky pošle na Make webhook (jeden router payload pro celý TRUCKMALL projekt)
+//   5) Uloží také do Apify Dataset pro historii
 //
-// Auth: persistence skrz Apify Key-Value Store → "bing-session" → storageState
+// Auth: NENÍ interaktivní login. Session musí být uploadnutá v KV Store 'bing-session'
+// (key 'storageState') předem pomocí export-bing-session.js skriptu lokálně.
+// Důvod: Bing WMT účet je registrovaný přes Google OAuth (libor.dospel@gmail.com),
+// ne Microsoft. Google OAuth login v headless Chromium není spolehlivý (CAPTCHA, 2FA).
+// Session typicky platí ~30 dní, pak je nutné spustit export skript znovu.
 
 import { Actor, log } from 'apify';
 import { chromium } from 'playwright';
@@ -20,8 +25,6 @@ await Actor.init();
 // ─── INPUT ────────────────────────────────────────────────────────────────
 const input = (await Actor.getInput()) ?? {};
 const {
-    msEmail = process.env.MS_EMAIL,
-    msPassword = process.env.MS_PASSWORD,
     makeWebhookUrl = process.env.MAKE_WEBHOOK_URL,
     sites = [
         'https://www.truckmall.cz/',
@@ -34,80 +37,45 @@ const {
     dryRun = false,
 } = input;
 
-if (!msEmail || !msPassword) {
-    log.warning(
-        'MS_EMAIL / MS_PASSWORD missing. Actor will only work if a valid storageState ' +
-        'is preloaded in KV Store "bing-session" (typically via Google OAuth from local ' +
-        'export). If session is invalid, this run will fail at login.',
-    );
-}
-
 log.info(`Run started: ${sites.length} sites, last ${daysBack} days, dryRun=${dryRun}`);
 
-// ─── BROWSER + SESSION ────────────────────────────────────────────────────
+// ─── SESSION LOAD ─────────────────────────────────────────────────────────
 const sessionStore = await Actor.openKeyValueStore('bing-session');
 const savedState = await sessionStore.getValue('storageState');
 
-// CRITICAL: --disable-features=WebAuthentication prevents Microsoft from routing
-// personal MSA logins to /consumers/fido/get (passkey screen). Without this,
-// MS detects browser supports WebAuthn and forces passkey instead of password.
-// Verified solution per GPT consensus (works in Apify headless Chromium).
-const browser = await chromium.launch({
-    headless: true,
-    args: ['--disable-features=WebAuthentication'],
-});
+if (!savedState) {
+    throw new Error(
+        'No session found in KV Store "bing-session" (key "storageState"). ' +
+        'Run export-bing-session.js locally to create one. ' +
+        'See README.md → "Initial Setup" section for instructions.',
+    );
+}
 
+log.info(`✓ Session loaded from KV Store (${savedState.cookies?.length ?? 0} cookies)`);
+
+// ─── BROWSER ──────────────────────────────────────────────────────────────
+const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({
-    storageState: savedState || undefined,
+    storageState: savedState,
     userAgent:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
         'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
     viewport: { width: 1400, height: 900 },
     locale: 'en-US',
 });
-
-// Defense in depth: also hide PublicKeyCredential at the JS level in case
-// MS detects it via JS check before submitting the email.
-await context.addInitScript(() => {
-    try { Object.defineProperty(window, 'PublicKeyCredential', { get: () => undefined }); } catch {}
-    try {
-        const proto = Object.getPrototypeOf(navigator);
-        Object.defineProperty(proto, 'credentials', { get: () => undefined });
-    } catch {}
-});
-
-// Defense in depth #2: intercept the GetCredentialType.srf POST and force
-// isFidoSupported=false. MS decides FIDO vs password based on this response.
-await context.route('https://login.live.com/**', async (route) => {
-    const req = route.request();
-    if (req.method() === 'POST' && /\/GetCredentialType\.srf$/.test(req.url())) {
-        try {
-            const body = JSON.parse(req.postData() || '{}');
-            body.isFidoSupported = false;
-            body.isFidoEnabled = false;
-            await route.continue({
-                postData: JSON.stringify(body),
-                headers: { ...req.headers(), 'content-type': 'application/json' },
-            });
-            return;
-        } catch (_) { /* fall through */ }
-    }
-    await route.continue();
-});
-
 const page = await context.newPage();
 
-// ─── LOGIN ────────────────────────────────────────────────────────────────
-async function isSessionValid() {
-    // Check actual API auth by calling profile endpoint, which requires login
+// ─── SESSION VALIDATION ───────────────────────────────────────────────────
+async function validateSession() {
+    log.info('Validating session …');
     await page.goto('https://www.bing.com/webmasters/home', { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(2000);
 
-    const profileCheck = await page.evaluate(async () => {
+    const result = await page.evaluate(async () => {
         try {
             const r = await fetch('/webmasters/api/globalelements/profile', {
                 credentials: 'include',
-                headers: { 'Accept': 'application/json' },
+                headers: { Accept: 'application/json' },
             });
             const text = await r.text();
             return {
@@ -120,190 +88,23 @@ async function isSessionValid() {
         }
     });
 
-    log.info(`Profile check: status=${profileCheck.status}, hasUser=${profileCheck.hasUserData}`);
-    return profileCheck.status === 200 && profileCheck.hasUserData;
+    log.info(`Profile check: status=${result.status}, hasUser=${result.hasUserData}`);
+
+    if (result.status !== 200 || !result.hasUserData) {
+        const screenshotBuf = await page.screenshot({ fullPage: true });
+        await Actor.setValue('session-expired.png', screenshotBuf, { contentType: 'image/png' });
+        throw new Error(
+            'Session expired or invalid. ' +
+            `Profile API returned status=${result.status}. ` +
+            'Run export-bing-session.js locally to refresh the session ' +
+            '(typically lasts ~30 days). See README.md.',
+        );
+    }
+
+    log.info('✓ Session valid');
 }
 
-async function ensureLoggedIn() {
-    log.info('Verifying Bing WMT session…');
-
-    if (await isSessionValid()) {
-        log.info('✓ Session valid, skipping login');
-        return;
-    }
-
-    log.warning('Session invalid or expired — fresh login needed');
-
-    if (!msEmail || !msPassword) {
-        throw new Error(
-            'Session is invalid and MS_EMAIL/MS_PASSWORD are not set. ' +
-            'EITHER provide MS credentials in Apify Secrets (works only for Microsoft-linked WMT accounts), ' +
-            'OR re-export a fresh storageState from a local Playwright login via Google OAuth ' +
-            'and upload it to KV Store "bing-session" → key "storageState". ' +
-            'See repo docs for export-bing-session.js script.',
-        );
-    }
-
-    // Per GPT+Gemini konsenzus: jdi PŘÍMO na BWT-specific signin URL.
-    // Ta zachová správný app context a auto-route pro @tdt.cz tenant na microsoftonline.com.
-    const BWT_SIGNIN_URL = 'https://www.bing.com/fd/auth/signin?action=interactive&provider=windows_live_id&return_url=https%3A%2F%2Fwww.bing.com%2Fwebmasters%2F';
-
-    log.info('Navigating directly to BWT signin URL …');
-    await page.goto(BWT_SIGNIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000);
-
-    const debugBuf1 = await page.screenshot({ fullPage: true });
-    await Actor.setValue('debug-1-after-signin-nav.png', debugBuf1, { contentType: 'image/png' });
-    log.info(`After signin nav, URL = ${page.url()}`);
-
-    // Microsoft email step — stable selectors per GPT:
-    //   input[name="loginfmt"] (id=i0116) — email
-    //   #idSIButton9 — primary Next/Submit/Yes button
-    // Fallback to input[type=email] if name attribute missing.
-    log.info('Waiting for email input …');
-    try {
-        await page.waitForSelector('input[name="loginfmt"], input[type="email"]', { timeout: 25000 });
-    } catch (err) {
-        const buf = await page.screenshot({ fullPage: true });
-        await Actor.setValue('debug-2-no-email-input.png', buf, { contentType: 'image/png' });
-        throw new Error(
-            'Email input not found after navigating to BWT signin URL. ' +
-            'Probably Microsoft login UI changed. See debug-2-no-email-input.png in KV Store. ' +
-            `Current URL: ${page.url()}`,
-        );
-    }
-
-    await page.fill('input[name="loginfmt"], input[type="email"]', msEmail);
-    await page.click('#idSIButton9, input[type="submit"], button[type="submit"]');
-    await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(3000);
-
-    log.info(`After email URL = ${page.url()}`);
-
-    // Screenshot ASAP after email so we can see what MS shows (FIDO? password? Authenticator?)
-    const debugBuf2 = await page.screenshot({ fullPage: true });
-    await Actor.setValue('debug-2-after-email.png', debugBuf2, { contentType: 'image/png' });
-
-    // Account type split tile for AAD vs MSA (rare but possible)
-    const aadTile = page.locator('#aadTile');
-    if (await aadTile.isVisible({ timeout: 2000 }).catch(() => false)) {
-        log.info('AAD/MSA split tile detected — choosing Work/School account');
-        await aadTile.click();
-        await page.waitForLoadState('domcontentloaded');
-        await page.waitForTimeout(2000);
-    }
-
-    // FIDO/passkey bypass: Microsoft may force passkey by default for personal MSA.
-    // Strategy: click "Back" to return to sign-in options, then pick Password tile.
-    if (page.url().includes('/fido/') || page.url().includes('/passkey')) {
-        log.info('FIDO/passkey page detected — clicking Back to return to sign-in options …');
-        const backSelectors = [
-            'button:has-text("Back")',
-            '#idBtn_Back',
-            'input[value="Back"]',
-            'a:has-text("Back")',
-        ];
-        let backClicked = false;
-        for (const sel of backSelectors) {
-            const el = page.locator(sel).first();
-            if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
-                log.info(`  Clicking Back: ${sel}`);
-                await el.click().catch(() => {});
-                await page.waitForLoadState('domcontentloaded').catch(() => {});
-                await page.waitForTimeout(2500);
-                backClicked = true;
-                break;
-            }
-        }
-
-        if (backClicked) {
-            const debugBuf2b = await page.screenshot({ fullPage: true });
-            await Actor.setValue('debug-2b-after-back-from-fido.png', debugBuf2b, { contentType: 'image/png' });
-            log.info(`After Back URL = ${page.url()}`);
-
-            // Now we should be on either the password input page OR a "Sign in options" picker
-            // Look for sign-in method picker / "Use your password" / Password tile
-            const pwSwitchSelectors = [
-                'a:has-text("Use your password")',
-                'a:has-text("Sign in with password")',
-                'button:has-text("Use your password")',
-                '#idA_PWD_SwitchToPassword',
-                'a[href*="password"]',
-                'a:has-text("Other ways to sign in")',
-                'a:has-text("Sign-in options")',
-                '#signInAnotherWay',
-            ];
-            for (const sel of pwSwitchSelectors) {
-                const el = page.locator(sel).first();
-                if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
-                    log.info(`  Clicking password switch: ${sel}`);
-                    await el.click().catch(() => {});
-                    await page.waitForLoadState('domcontentloaded').catch(() => {});
-                    await page.waitForTimeout(2000);
-                    break;
-                }
-            }
-
-            // Some flows show a tile picker → choose Password
-            const passwordTile = page.locator(
-                'div[role="button"]:has-text("Password"), button:has-text("Password"), [data-value="password"]'
-            ).first();
-            if (await passwordTile.isVisible({ timeout: 2000 }).catch(() => false)) {
-                log.info('  Selecting "Password" tile …');
-                await passwordTile.click().catch(() => {});
-                await page.waitForLoadState('domcontentloaded').catch(() => {});
-                await page.waitForTimeout(2000);
-            }
-
-            const debugBuf2c = await page.screenshot({ fullPage: true });
-            await Actor.setValue('debug-2c-after-password-switch.png', debugBuf2c, { contentType: 'image/png' });
-        } else {
-            log.warning('Back button not found on FIDO page — see debug-2-after-email.png');
-        }
-    }
-
-    // Password step
-    log.info('Waiting for password input …');
-    await page.waitForSelector('input[name="passwd"], input[type="password"]', { timeout: 25000 });
-    await page.fill('input[name="passwd"], input[type="password"]', msPassword);
-    await page.click('#idSIButton9, input[type="submit"], button[type="submit"]');
-
-    log.warning('🔔 PASSWORD SUBMITTED — Approve the push in Microsoft Authenticator app on your phone (up to 120s)…');
-    const debugBuf3 = await page.screenshot({ fullPage: true });
-    await Actor.setValue('debug-3-after-password.png', debugBuf3, { contentType: 'image/png' });
-
-    // Wait for final redirect back to Bing WMT. MFA approval happens on the phone during this wait.
-    try {
-        await page.waitForURL(/bing\.com\/webmasters/, { timeout: 120000 });
-    } catch (err) {
-        const screenshotBuf = await page.screenshot({ fullPage: true });
-        await Actor.setValue('mfa-blocker.png', screenshotBuf, { contentType: 'image/png' });
-        throw new Error(
-            'Login did not reach Webmaster Tools within 120s. ' +
-            'MFA challenge probably waiting on phone — open Authenticator app and approve. ' +
-            'See mfa-blocker.png in KV Store for current state.',
-        );
-    }
-
-    // KMSI "Stay signed in?" prompt — choose Yes to persist session longer
-    const kmsiYes = page.locator('#idSIButton9');
-    if (await kmsiYes.isVisible({ timeout: 5000 }).catch(() => false)) {
-        log.info('KMSI prompt detected — clicking Yes to stay signed in');
-        await kmsiYes.click();
-        await page.waitForLoadState('networkidle').catch(() => {});
-    }
-
-    // Verify session via profile API — robust check
-    if (!(await isSessionValid())) {
-        const screenshotBuf = await page.screenshot({ fullPage: true });
-        await Actor.setValue('post-login-failed.png', screenshotBuf, { contentType: 'image/png' });
-        throw new Error('Login flow completed but profile API still returns invalid. Session not established.');
-    }
-
-    log.info('✓ Login successful, persisting session to KV Store');
-    const fresh = await context.storageState();
-    await sessionStore.setValue('storageState', fresh);
-}
+await validateSession();
 
 // ─── API HELPERS ──────────────────────────────────────────────────────────
 function formatRFC1123(date) {
@@ -355,11 +156,8 @@ function safeJSON(s) {
 const today = new Date();
 const startDate = new Date(today.getTime() - daysBack * 24 * 60 * 60 * 1000);
 
-await ensureLoggedIn();
-
 // Get CSRF token once — valid for entire session (not per-site)
 log.info('Fetching CSRF token from /webmasters/auth/token …');
-await page.goto('https://www.bing.com/webmasters/home', { waitUntil: 'domcontentloaded' });
 const csrf = await getCSRF();
 log.info(`✓ CSRF token obtained (${csrf.substring(0, 8)}…)`);
 
@@ -425,6 +223,16 @@ for (const siteUrl of sites) {
     }
 }
 
+// ─── PERSIST REFRESHED SESSION ────────────────────────────────────────────
+// Bing may rotate cookies during the run — save the latest state back.
+try {
+    const fresh = await context.storageState();
+    await sessionStore.setValue('storageState', fresh);
+    log.info('✓ Session state refreshed in KV Store');
+} catch (err) {
+    log.warning(`Could not persist refreshed session: ${err.message}`);
+}
+
 // ─── OUTPUT ───────────────────────────────────────────────────────────────
 // 1. Apify Dataset (historický log, queryable)
 await Actor.pushData(allData);
@@ -434,7 +242,7 @@ await Actor.setValue('latest', allData);
 
 // 3. Make webhook
 if (makeWebhookUrl && !dryRun) {
-    log.info(`Posting results to Make webhook…`);
+    log.info('Posting results to Make webhook…');
     const r = await fetch(makeWebhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

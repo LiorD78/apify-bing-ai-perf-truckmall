@@ -1,12 +1,13 @@
 {
     "name": "bing-ai-performance-truckmall",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "type": "module",
-    "description": "Scrapes Bing Webmaster Tools AI Performance data for TRUCKMALL group (truckmall.cz/.sk, tdt.cz/.sk, tagra.eu) and pushes to Make webhook.",
+    "description": "Scrapes Bing Webmaster Tools AI Performance data for TRUCKMALL group (truckmall.cz/.sk, tdt.cz/.sk, tagra.eu) and pushes to Make webhook. Uses session-based auth (no interactive login).",
     "engines": { "node": ">=20" },
     "scripts": {
         "start": "node src/main.js",
-        "test": "node src/main.js --dryRun"
+        "test": "node src/main.js --dryRun",
+        "export-session": "node export-bing-session.js"
     },
     "dependencies": {
         "apify": "^3.2.6",
