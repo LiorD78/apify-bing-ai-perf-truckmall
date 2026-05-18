@@ -143,48 +143,71 @@ async function ensureLoggedIn() {
     }
 
     // FIDO/passkey bypass: Microsoft may force passkey by default for personal MSA.
-    // Look for "Use your password instead" or "Sign in another way" or similar links.
+    // Strategy: click "Back" to return to sign-in options, then pick Password tile.
     if (page.url().includes('/fido/') || page.url().includes('/passkey')) {
-        log.info('FIDO/passkey page detected, looking for password fallback link …');
-        const fallbackSelectors = [
-            'a:has-text("Use your password")',
-            'a:has-text("Sign in with password")',
-            'button:has-text("Use your password")',
-            'a:has-text("Sign-in options")',
-            'a:has-text("Sign in another way")',
-            'a:has-text("Other ways to sign in")',
-            'a[href*="password"]',
-            '#idA_PWD_SwitchToPassword',
-            '#signInAnotherWay',
-            '[data-testid*="signInOptions"]',
+        log.info('FIDO/passkey page detected — clicking Back to return to sign-in options …');
+        const backSelectors = [
+            'button:has-text("Back")',
+            '#idBtn_Back',
+            'input[value="Back"]',
+            'a:has-text("Back")',
         ];
-        let bypassed = false;
-        for (const sel of fallbackSelectors) {
+        let backClicked = false;
+        for (const sel of backSelectors) {
             const el = page.locator(sel).first();
             if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
-                log.info(`  Clicking password fallback: ${sel}`);
+                log.info(`  Clicking Back: ${sel}`);
                 await el.click().catch(() => {});
                 await page.waitForLoadState('domcontentloaded').catch(() => {});
-                await page.waitForTimeout(2000);
-                bypassed = true;
+                await page.waitForTimeout(2500);
+                backClicked = true;
                 break;
             }
         }
-        if (bypassed) {
-            // Some flows show a list of options — pick "Password" tile
+
+        if (backClicked) {
+            const debugBuf2b = await page.screenshot({ fullPage: true });
+            await Actor.setValue('debug-2b-after-back-from-fido.png', debugBuf2b, { contentType: 'image/png' });
+            log.info(`After Back URL = ${page.url()}`);
+
+            // Now we should be on either the password input page OR a "Sign in options" picker
+            // Look for sign-in method picker / "Use your password" / Password tile
+            const pwSwitchSelectors = [
+                'a:has-text("Use your password")',
+                'a:has-text("Sign in with password")',
+                'button:has-text("Use your password")',
+                '#idA_PWD_SwitchToPassword',
+                'a[href*="password"]',
+                'a:has-text("Other ways to sign in")',
+                'a:has-text("Sign-in options")',
+                '#signInAnotherWay',
+            ];
+            for (const sel of pwSwitchSelectors) {
+                const el = page.locator(sel).first();
+                if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
+                    log.info(`  Clicking password switch: ${sel}`);
+                    await el.click().catch(() => {});
+                    await page.waitForLoadState('domcontentloaded').catch(() => {});
+                    await page.waitForTimeout(2000);
+                    break;
+                }
+            }
+
+            // Some flows show a tile picker → choose Password
             const passwordTile = page.locator(
                 'div[role="button"]:has-text("Password"), button:has-text("Password"), [data-value="password"]'
             ).first();
-            if (await passwordTile.isVisible({ timeout: 3000 }).catch(() => false)) {
-                log.info('  Selecting "Password" from options list …');
+            if (await passwordTile.isVisible({ timeout: 2000 }).catch(() => false)) {
+                log.info('  Selecting "Password" tile …');
                 await passwordTile.click().catch(() => {});
                 await page.waitForLoadState('domcontentloaded').catch(() => {});
                 await page.waitForTimeout(2000);
             }
-            const debugBuf2b = await page.screenshot({ fullPage: true });
-            await Actor.setValue('debug-2b-after-fido-bypass.png', debugBuf2b, { contentType: 'image/png' });
+
+            const debugBuf2c = await page.screenshot({ fullPage: true });
+            await Actor.setValue('debug-2c-after-password-switch.png', debugBuf2c, { contentType: 'image/png' });
         } else {
-            log.warning('Could not find password fallback link on FIDO page — see debug-2-after-email.png');
+            log.warning('Back button not found on FIDO page — see debug-2-after-email.png');
         }
     }
 
