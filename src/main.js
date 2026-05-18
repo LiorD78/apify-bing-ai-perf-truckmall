@@ -93,76 +93,61 @@ async function ensureLoggedIn() {
 
     log.warning('Session invalid or expired — performing fresh login');
 
-    // Direct sign-in URL: Bing WMT's protected dashboard, will 302 to login.live.com if not authed
-    log.info('Navigating to sign-in entrypoint …');
-    await page.goto('https://www.bing.com/webmasters/dashboard', {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000,
-    });
+    // Per GPT+Gemini konsenzus: jdi PŘÍMO na BWT-specific signin URL.
+    // Ta zachová správný app context a auto-route pro @tdt.cz tenant na microsoftonline.com.
+    const BWT_SIGNIN_URL = 'https://www.bing.com/fd/auth/signin?action=interactive&provider=windows_live_id&return_url=https%3A%2F%2Fwww.bing.com%2Fwebmasters%2F';
+
+    log.info('Navigating directly to BWT signin URL …');
+    await page.goto(BWT_SIGNIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
 
-    // Debug screenshot — see what we got
     const debugBuf1 = await page.screenshot({ fullPage: true });
-    await Actor.setValue('debug-1-after-dashboard-nav.png', debugBuf1, { contentType: 'image/png' });
-    log.info(`After dashboard nav, URL = ${page.url()}`);
+    await Actor.setValue('debug-1-after-signin-nav.png', debugBuf1, { contentType: 'image/png' });
+    log.info(`After signin nav, URL = ${page.url()}`);
 
-    // If we're not on a Microsoft login page yet, try clicking any "Sign in" element on the homepage
-    if (!page.url().includes('login.') && !page.url().includes('account.')) {
-        log.info('Not on login page yet, trying to click sign-in elements …');
-        // Bing WMT homepage anonymous variants — try multiple selector patterns
-        const signInSelectors = [
-            'a[href*="login.live"]',
-            'a[href*="signin"]',
-            'a[href*="login.microsoft"]',
-            'a:has-text("Sign in")',
-            'button:has-text("Sign in")',
-            'a:has-text("Get started")',
-            '[data-testid*="signin" i]',
-            '[aria-label*="sign in" i]',
-        ];
-        let clicked = false;
-        for (const sel of signInSelectors) {
-            const el = page.locator(sel).first();
-            if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
-                log.info(`  Clicking selector: ${sel}`);
-                await el.click().catch(() => {});
-                await page.waitForLoadState('domcontentloaded').catch(() => {});
-                await page.waitForTimeout(2000);
-                clicked = true;
-                break;
-            }
-        }
-        if (!clicked) {
-            const debugBuf2 = await page.screenshot({ fullPage: true });
-            await Actor.setValue('debug-2-no-signin-button.png', debugBuf2, { contentType: 'image/png' });
-            log.warning('No Sign In selector found — Bing UI may have changed. See debug-2-no-signin-button.png');
-        }
+    // Microsoft email step — stable selectors per GPT:
+    //   input[name="loginfmt"] (id=i0116) — email
+    //   #idSIButton9 — primary Next/Submit/Yes button
+    // Fallback to input[type=email] if name attribute missing.
+    log.info('Waiting for email input …');
+    try {
+        await page.waitForSelector('input[name="loginfmt"], input[type="email"]', { timeout: 25000 });
+    } catch (err) {
+        const buf = await page.screenshot({ fullPage: true });
+        await Actor.setValue('debug-2-no-email-input.png', buf, { contentType: 'image/png' });
+        throw new Error(
+            'Email input not found after navigating to BWT signin URL. ' +
+            'Probably Microsoft login UI changed. See debug-2-no-email-input.png in KV Store. ' +
+            `Current URL: ${page.url()}`,
+        );
     }
 
-    // We should now be on Microsoft login (login.live.com or login.microsoftonline.com)
-    log.info(`Pre-email URL = ${page.url()}`);
-    const debugBuf3 = await page.screenshot({ fullPage: true });
-    await Actor.setValue('debug-3-before-email.png', debugBuf3, { contentType: 'image/png' });
-
-    // Microsoft email step — broader selectors to handle live.com vs microsoftonline.com
-    await page.waitForSelector('input[type="email"], input[name="loginfmt"]', { timeout: 30000 });
-    await page.fill('input[type="email"], input[name="loginfmt"]', msEmail);
-    await page.click('input[type="submit"], button[type="submit"]');
+    await page.fill('input[name="loginfmt"], input[type="email"]', msEmail);
+    await page.click('#idSIButton9, input[type="submit"], button[type="submit"]');
     await page.waitForLoadState('domcontentloaded');
     await page.waitForTimeout(2000);
 
     log.info(`After email URL = ${page.url()}`);
 
+    // Account type split tile for AAD vs MSA (rare but possible)
+    const aadTile = page.locator('#aadTile');
+    if (await aadTile.isVisible({ timeout: 2000 }).catch(() => false)) {
+        log.info('AAD/MSA split tile detected — choosing Work/School account');
+        await aadTile.click();
+        await page.waitForLoadState('domcontentloaded');
+    }
+
     // Password step
-    await page.waitForSelector('input[type="password"], input[name="passwd"]', { timeout: 15000 });
-    await page.fill('input[type="password"], input[name="passwd"]', msPassword);
-    await page.click('input[type="submit"], button[type="submit"]');
+    log.info('Waiting for password input …');
+    await page.waitForSelector('input[name="passwd"], input[type="password"]', { timeout: 20000 });
+    await page.fill('input[name="passwd"], input[type="password"]', msPassword);
+    await page.click('#idSIButton9, input[type="submit"], button[type="submit"]');
 
-    // MFA may be required here — see runtime logs
-    log.info('Submitted password. Waiting for MFA approval on phone (up to 120s)…');
-    const debugBuf4 = await page.screenshot({ fullPage: true });
-    await Actor.setValue('debug-4-after-password.png', debugBuf4, { contentType: 'image/png' });
+    log.warning('🔔 PASSWORD SUBMITTED — Approve the push in Microsoft Authenticator app on your phone (up to 120s)…');
+    const debugBuf3 = await page.screenshot({ fullPage: true });
+    await Actor.setValue('debug-3-after-password.png', debugBuf3, { contentType: 'image/png' });
 
+    // Wait for final redirect back to Bing WMT. MFA approval happens on the phone during this wait.
     try {
         await page.waitForURL(/bing\.com\/webmasters/, { timeout: 120000 });
     } catch (err) {
@@ -170,19 +155,20 @@ async function ensureLoggedIn() {
         await Actor.setValue('mfa-blocker.png', screenshotBuf, { contentType: 'image/png' });
         throw new Error(
             'Login did not reach Webmaster Tools within 120s. ' +
-            'Probably MFA challenge waiting on phone. Open mfa-blocker.png in KV Store. ' +
-            'Solution: ensure Authenticator app is in hand when starting the actor.',
+            'MFA challenge probably waiting on phone — open Authenticator app and approve. ' +
+            'See mfa-blocker.png in KV Store for current state.',
         );
     }
 
-    // "Stay signed in?" prompt
-    const staySignedIn = page.locator('input[value="Yes"], button:has-text("Yes")').first();
-    if (await staySignedIn.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await staySignedIn.click();
+    // KMSI "Stay signed in?" prompt — choose Yes to persist session longer
+    const kmsiYes = page.locator('#idSIButton9');
+    if (await kmsiYes.isVisible({ timeout: 5000 }).catch(() => false)) {
+        log.info('KMSI prompt detected — clicking Yes to stay signed in');
+        await kmsiYes.click();
         await page.waitForLoadState('networkidle').catch(() => {});
     }
 
-    // Verify the session is actually working
+    // Verify session via profile API — robust check
     if (!(await isSessionValid())) {
         const screenshotBuf = await page.screenshot({ fullPage: true });
         await Actor.setValue('post-login-failed.png', screenshotBuf, { contentType: 'image/png' });
