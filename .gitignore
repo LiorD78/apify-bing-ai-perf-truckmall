@@ -1,0 +1,20 @@
+# Apify
+apify_storage/
+storage/
+
+# Node
+node_modules/
+*.log
+npm-debug.log*
+
+# Session export (NIKDY necommitovat - obsahuje auth cookies!)
+bing-storage-state.json
+*.session.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

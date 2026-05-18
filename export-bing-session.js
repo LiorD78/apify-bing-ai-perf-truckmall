@@ -4,34 +4,94 @@
  * =========================================
  *
  * Otevře viditelné Chrome okno, ty se přihlásíš přes "Sign in with Google"
- * v Bing Webmaster Tools, script uloží storageState.json na disk.
+ * v Bing Webmaster Tools, script uloží storageState.json a uploadne přímo
+ * do Apify KV Store 'bing-session' (key 'storageState').
  *
- * Poté ten JSON pošleš Claude (nebo uploadne přes Apify API) do KV Store
- * 'bing-session' jako key 'storageState'. Apify actor pak při startu session
- * načte a běží denně bez nutnosti loginu (~30 dní platí).
+ * Apify actor pak při startu session načte a běží denně bez nutnosti loginu
+ * (~30 dní platí, pak je nutné spustit tento skript znovu).
+ *
+ * KDY SPUSTIT:
+ *   - Poprvé před prvním Apify runem
+ *   - Když Apify run failuje s "Session expired" (typicky po ~30 dnech)
  *
  * USAGE:
- *   1) cd ~/Downloads  (nebo kamkoli)
- *   2) mkdir bing-session-export && cd bing-session-export
- *   3) npm init -y
- *   4) npm install playwright
- *   5) npx playwright install chromium
+ *   1) cd ~/path/to/apify-bing-ai-perf-truckmall
+ *   2) npm install (jen poprvé)
+ *   3) npx playwright install chromium (jen poprvé)
+ *   4) export APIFY_TOKEN="apify_api_..."           (z Apify Console → Settings → API)
+ *   5) export APIFY_KV_STORE_ID="pbSattQT3QKR63WIv" (z Apify Storage → bing-session)
+ *      (nebo nech default — viz konstanta níže)
  *   6) node export-bing-session.js
  *   7) Otevře se Chrome → klikni "Sign In" → Google → tvůj účet → schval permission
- *   8) Až vidíš dashboard truckmall.cz, stiskni ENTER v terminálu
- *   9) Soubor bing-storage-state.json se uloží do aktuální složky
- *  10) Pošli mi ten JSON tady do chatu
+ *   8) Až vidíš Bing WMT dashboard, vrať se do terminálu a stiskni ENTER
+ *   9) Skript uloží storageState lokálně AND nahraje do Apify KV Store
+ *
+ * ENV VARS:
+ *   APIFY_TOKEN          (required pro upload)  — Apify API token
+ *   APIFY_KV_STORE_ID    (optional)             — KV store ID, default: pbSattQT3QKR63WIv
+ *   SKIP_UPLOAD          (optional, "1")        — uloží jen lokálně, neuploadne
  */
 
 const { chromium } = require('playwright');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 
 const OUTPUT_FILE = path.join(process.cwd(), 'bing-storage-state.json');
+const DEFAULT_KV_STORE_ID = 'pbSattQT3QKR63WIv';
+
+const APIFY_TOKEN = process.env.APIFY_TOKEN;
+const APIFY_KV_STORE_ID = process.env.APIFY_KV_STORE_ID || DEFAULT_KV_STORE_ID;
+const SKIP_UPLOAD = process.env.SKIP_UPLOAD === '1';
+
+function uploadToApify(storeId, key, data) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify(data);
+        const req = https.request({
+            method: 'PUT',
+            hostname: 'api.apify.com',
+            path: `/v2/key-value-stores/${storeId}/records/${key}`,
+            headers: {
+                'Authorization': `Bearer ${APIFY_TOKEN}`,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            },
+        }, (res) => {
+            let chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => {
+                const responseBody = Buffer.concat(chunks).toString('utf8');
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    resolve({ status: res.statusCode, body: responseBody });
+                } else {
+                    reject(new Error(`Apify API HTTP ${res.statusCode}: ${responseBody}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
 
 (async () => {
-    console.log('🚀 Spouštím Chromium (viditelné okno) ...');
+    // Pre-flight checks
+    if (!SKIP_UPLOAD && !APIFY_TOKEN) {
+        console.error('');
+        console.error('❌ APIFY_TOKEN env var není nastaven.');
+        console.error('');
+        console.error('Buď ho nastav:');
+        console.error('   export APIFY_TOKEN="apify_api_..."');
+        console.error('   (najdeš v Apify Console → Settings → API & Integrations → Default API token)');
+        console.error('');
+        console.error('Nebo přeskoč upload a uploadni JSON ručně:');
+        console.error('   SKIP_UPLOAD=1 node export-bing-session.js');
+        console.error('');
+        process.exit(1);
+    }
+
+    console.log('🚀 Spouštím Chromium (viditelné okno) …');
     const browser = await chromium.launch({
         headless: false,
         args: ['--start-maximized'],
@@ -80,20 +140,42 @@ const OUTPUT_FILE = path.join(process.cwd(), 'bing-storage-state.json');
     console.log(`   - ${googleCookies.length} Google cookies`);
     console.log(`   - ${state.origins.length} localStorage origins`);
 
-    fs.writeFileSync(OUTPUT_FILE, JSON.stringify(state, null, 2));
-    console.log('');
-    console.log(`✅ Hotovo! Session uložena do: ${OUTPUT_FILE}`);
-    console.log('');
-    console.log('━'.repeat(70));
-    console.log('   DALŠÍ KROK:');
-    console.log('   Otevři soubor bing-storage-state.json a celý obsah');
-    console.log('   pošli Claude do chatu (nebo upload do Apify KV Store ručně).');
-    console.log('━'.repeat(70));
+    if (bingCookies.length === 0) {
+        console.warn('');
+        console.warn('⚠️  ŽÁDNÉ Bing cookies — pravděpodobně jsi nebyl přihlášen do Bing WMT.');
+        console.warn('   Zavři tento skript (Ctrl+C), zkontroluj že vidíš dashboard, spusť znovu.');
+    }
 
-    // Necháme browser otevřený pro vizuální verifikaci
+    fs.writeFileSync(OUTPUT_FILE, JSON.stringify(state, null, 2));
+    console.log(`✅ Lokální záloha: ${OUTPUT_FILE}`);
+
+    // Upload to Apify
+    if (SKIP_UPLOAD) {
+        console.log('');
+        console.log('⏭️  SKIP_UPLOAD=1 — neuploaduji do Apify.');
+        console.log('   Pošli soubor Claudovi do chatu nebo uploadni ručně přes Apify Console.');
+    } else {
+        console.log('');
+        console.log(`☁️  Uploaduji do Apify KV Store ${APIFY_KV_STORE_ID} (key: storageState) …`);
+        try {
+            await uploadToApify(APIFY_KV_STORE_ID, 'storageState', state);
+            console.log('✅ Session úspěšně nahrána do Apify!');
+            console.log('');
+            console.log('   Apify actor teď můžeš spustit kdykoli:');
+            console.log('   https://console.apify.com/actors/TDxaZ9eaJabUpXBdX/source');
+        } catch (err) {
+            console.error('');
+            console.error('❌ Upload selhal:', err.message);
+            console.error('');
+            console.error('Lokální záloha je v', OUTPUT_FILE);
+            console.error('Můžeš ji uploadnout ručně přes Apify Console → Storage → bing-session.');
+        }
+    }
+
     console.log('');
-    console.log('Browser zůstává otevřený. Zavři ho ručně až budeš hotov.');
-    // Don't close — let user inspect
+    console.log('━'.repeat(70));
+    console.log('   Browser zůstává otevřený. Zavři ho ručně až budeš hotov.');
+    console.log('━'.repeat(70));
 
 })().catch((err) => {
     console.error('❌ Chyba:', err);
